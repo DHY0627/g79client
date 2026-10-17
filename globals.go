@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -189,6 +190,13 @@ func fetchG79PatchMetadata() (*PatchMetadata, error) {
 	}, nil
 }
 
+// 正常情况下引擎版本与 patchlist 的大版本前缀是一致的（例如引擎 3.9.x 对应 patch
+// 3.9.41.300665）。但网易偶尔会先发布新的客户端安装包——packlist 的 netease.version
+// 已变成 3.10.0.300878——而 patchlist 与 patch 资源仍停留在 3.9.41，导致精确前缀匹配
+// 落空、登录初始化直接失败。为了在这种情况下仍然可用，这里按以下顺序降级：
+//  1. 取与引擎版本前两段前缀一致的最新 patch（原有行为）；
+//  2. 前缀逐级放宽后取最新匹配（3.10 -> 3.）；
+//  3. 兜底取 patchlist 中最新的一项。
 func selectAndroidPatchVersion(versions []string) (string, error) {
 	if len(versions) == 0 {
 		return "", fmt.Errorf("no android patch versions available")
@@ -197,12 +205,37 @@ func selectAndroidPatchVersion(versions []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for i := len(versions) - 1; i >= 0; i-- {
-		if strings.HasPrefix(versions[i], base) {
-			return versions[i], nil
+	if v := latestVersionWithPrefix(versions, base); v != "" {
+		return v, nil
+	}
+	// 服务端版本发布不同步：逐级放宽前缀重试，例如 "3.10" -> "3."
+	prefix := base
+	for {
+		idx := strings.LastIndex(prefix, ".")
+		if idx < 0 {
+			break
+		}
+		prefix = prefix[:idx]
+		if v := latestVersionWithPrefix(versions, prefix+"."); v != "" {
+			log.Printf("[g79client] 引擎版本 %s 在 patchlist 中没有前缀 %s 的 patch，已降级使用 %s",
+				EngineVersion, base, v)
+			return v, nil
 		}
 	}
-	return "", fmt.Errorf("no android patch version matches base prefix %s", base)
+	fallback := versions[len(versions)-1]
+	log.Printf("[g79client] 引擎版本 %s 在 patchlist 中无任何匹配，已回退到最新的 patch 版本 %s",
+		EngineVersion, fallback)
+	return fallback, nil
+}
+
+// latestVersionWithPrefix 返回列表中最后一个以 prefix 开头的版本，找不到时返回空字符串。
+func latestVersionWithPrefix(versions []string, prefix string) string {
+	for i := len(versions) - 1; i >= 0; i-- {
+		if strings.HasPrefix(versions[i], prefix) {
+			return versions[i]
+		}
+	}
+	return ""
 }
 
 func getEngineBasePrefix() (string, error) {
